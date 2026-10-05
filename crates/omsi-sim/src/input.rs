@@ -21,10 +21,18 @@ pub enum EngineAction {
 /// invalid means 1 (unchanged behaviour).
 pub fn steer_return_scale() -> f32 {
     static SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *SCALE.get_or_init(|| parse_steer_return_scale(std::env::var("OMSI_STEER_RETURN").ok().as_deref()))
+    *SCALE.get_or_init(|| parse_scale(std::env::var("OMSI_STEER_RETURN").ok().as_deref()))
 }
 
-fn parse_steer_return_scale(v: Option<&str>) -> f32 {
+/// Multiplier for the pace at which the steering keys turn the wheel, read once from
+/// `OMSI_STEER_SPEED` (e.g. `1.5` = half again as fast). Same range and fallback as
+/// `steer_return_scale`.
+pub fn steer_key_scale() -> f32 {
+    static SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| parse_scale(std::env::var("OMSI_STEER_SPEED").ok().as_deref()))
+}
+
+fn parse_scale(v: Option<&str>) -> f32 {
     v.and_then(|s| s.trim().parse::<f32>().ok())
         .filter(|x| x.is_finite() && *x > 0.0)
         .map(|x| x.clamp(0.1, 10.0))
@@ -87,6 +95,9 @@ pub struct KeyboardAxes {
     /// Multiplier for the pace the wheel comes back at; 0 (the default) takes
     /// `steer_return_scale()`, i.e. `OMSI_STEER_RETURN`.
     pub return_scale: f32,
+    /// Multiplier for the pace the keys turn the wheel at; 0 (the default) takes
+    /// `steer_key_scale()`, i.e. `OMSI_STEER_SPEED`.
+    pub key_scale: f32,
 }
 
 impl KeyboardAxes {
@@ -120,6 +131,7 @@ impl KeyboardAxes {
             pedal_hold: self.pedal_hold,
             centering: self.centering,
             return_scale: self.return_scale,
+            key_scale: self.key_scale,
             ..Default::default()
         };
     }
@@ -160,7 +172,8 @@ impl KeyboardAxes {
         let red = self.red();
         let scale = if self.return_scale > 0.0 { self.return_scale } else { steer_return_scale() };
         let back = if self.linear { back * red } else { back } * scale;
-        (rate * red, back)
+        let keys = if self.key_scale > 0.0 { self.key_scale } else { steer_key_scale() };
+        (rate * red * keys, back)
     }
 
     /// Where a wheel let go at `steering` is `dt` later, as this bus's comes back by itself:
@@ -259,12 +272,30 @@ mod tests {
 
     #[test]
     fn steer_return_scale_parses_and_clamps() {
-        assert_eq!(parse_steer_return_scale(None), 1.0);
-        assert_eq!(parse_steer_return_scale(Some("")), 1.0);
-        assert_eq!(parse_steer_return_scale(Some("abc")), 1.0);
-        assert_eq!(parse_steer_return_scale(Some("-2")), 1.0);
-        assert_eq!(parse_steer_return_scale(Some(" 2.5 ")), 2.5);
-        assert_eq!(parse_steer_return_scale(Some("50")), 10.0);
+        assert_eq!(parse_scale(None), 1.0);
+        assert_eq!(parse_scale(Some("")), 1.0);
+        assert_eq!(parse_scale(Some("abc")), 1.0);
+        assert_eq!(parse_scale(Some("-2")), 1.0);
+        assert_eq!(parse_scale(Some(" 2.5 ")), 2.5);
+        assert_eq!(parse_scale(Some("50")), 10.0);
+    }
+
+    #[test]
+    fn key_scale_speeds_up_the_keys_only() {
+        let turned = |scale: f32| {
+            let mut a = KeyboardAxes { key_scale: scale, speed_kmh: 30.0, ..Default::default() };
+            a.right_key = true;
+            for _ in 0..20 {
+                a.update(0.01);
+            }
+            a.steering
+        };
+        let (normal, fast) = (turned(1.0), turned(2.0));
+        assert!((fast - 2.0 * normal).abs() < 1e-4, "x2 keys must turn twice as far: {fast} vs {normal}");
+        // the return's pace stays the same
+        let a = KeyboardAxes { key_scale: 2.0, speed_kmh: 30.0, ..Default::default() };
+        let b = KeyboardAxes { key_scale: 1.0, speed_kmh: 30.0, ..Default::default() };
+        assert_eq!(a.paces().1, b.paces().1);
     }
 
     #[test]
