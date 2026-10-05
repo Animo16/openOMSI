@@ -1,0 +1,89 @@
+diff --git a/crates/omsi-sim/src/input.rs b/crates/omsi-sim/src/input.rs
+index d413929..1533e28 100644
+--- a/crates/omsi-sim/src/input.rs
++++ b/crates/omsi-sim/src/input.rs
+@@ -16,6 +16,21 @@ pub enum EngineAction {
+     SteeringNeutral,
+ }
+ 
++/// Multiplier for the pace at which a released steering wheel returns to centre, read once
++/// from `OMSI_STEER_RETURN` (e.g. `2` = twice as fast). Clamped to 0.1..10; unset, empty or
++/// invalid means 1 (unchanged behaviour).
++pub fn steer_return_scale() -> f32 {
++    static SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
++    *SCALE.get_or_init(|| parse_steer_return_scale(std::env::var("OMSI_STEER_RETURN").ok().as_deref()))
++}
++
++fn parse_steer_return_scale(v: Option<&str>) -> f32 {
++    v.and_then(|s| s.trim().parse::<f32>().ok())
++        .filter(|x| x.is_finite() && *x > 0.0)
++        .map(|x| x.clamp(0.1, 10.0))
++        .unwrap_or(1.0)
++}
++
+ pub fn engine_action(name: &str) -> Option<EngineAction> {
+     Some(match name.to_ascii_lowercase().as_str() {
+         "throttle" => EngineAction::Throttle,
+@@ -69,6 +84,9 @@ pub struct KeyboardAxes {
+     /// The steering is on its way back to the middle (Omsi.exe +0x5d6): set by the
+     /// `steering_neutral` key, cleared by a steering key.
+     pub centering: bool,
++    /// Multiplier for the pace the wheel comes back at; 0 (the default) takes
++    /// `steer_return_scale()`, i.e. `OMSI_STEER_RETURN`.
++    pub return_scale: f32,
+ }
+ 
+ impl KeyboardAxes {
+@@ -101,6 +119,7 @@ impl KeyboardAxes {
+             lock_curvature: self.lock_curvature,
+             pedal_hold: self.pedal_hold,
+             centering: self.centering,
++            return_scale: self.return_scale,
+             ..Default::default()
+         };
+     }
+@@ -139,7 +158,9 @@ impl KeyboardAxes {
+         };
+         // `[redSteerSpd]`: the key's pace, and OMSI's return (the linear one), less at speed
+         let red = self.red();
+-        (rate * red, if self.linear { back * red } else { back })
++        let scale = if self.return_scale > 0.0 { self.return_scale } else { steer_return_scale() };
++        let back = if self.linear { back * red } else { back } * scale;
++        (rate * red, back)
+     }
+ 
+     /// Where a wheel let go at `steering` is `dt` later, as this bus's comes back by itself:
+@@ -236,6 +257,33 @@ impl KeyboardAxes {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn steer_return_scale_parses_and_clamps() {
++        assert_eq!(parse_steer_return_scale(None), 1.0);
++        assert_eq!(parse_steer_return_scale(Some("")), 1.0);
++        assert_eq!(parse_steer_return_scale(Some("abc")), 1.0);
++        assert_eq!(parse_steer_return_scale(Some("-2")), 1.0);
++        assert_eq!(parse_steer_return_scale(Some(" 2.5 ")), 2.5);
++        assert_eq!(parse_steer_return_scale(Some("50")), 10.0);
++    }
++
++    #[test]
++    fn return_scale_speeds_up_the_return() {
++        let after = |scale: f32| {
++            let mut a = KeyboardAxes { return_scale: scale, speed_kmh: 30.0, steering: 0.8, ..Default::default() };
++            for _ in 0..50 {
++                a.update(0.01);
++            }
++            a.steering
++        };
++        let (normal, fast) = (after(1.0), after(3.0));
++        assert!(fast < normal, "x3 must come back further: {fast} vs {normal}");
++        // the keys' pace stays the same
++        let a = KeyboardAxes { return_scale: 3.0, speed_kmh: 30.0, ..Default::default() };
++        let b = KeyboardAxes { return_scale: 1.0, speed_kmh: 30.0, ..Default::default() };
++        assert_eq!(a.paces().0, b.paces().0);
++    }
++
+     #[test]
+     fn linear_and_old_steering_as_omsi() {
+         let mut a = KeyboardAxes { linear: true, old_steering: true, lock_curvature: 0.1, speed_kmh: 50.0, ..Default::default() };
